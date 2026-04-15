@@ -10,6 +10,27 @@
      STEP 1: Paste your Firebase config below.
      Same config as admin.html and buzzer.html.
      ============================================================ -->
+<script>
+  // Pre-warm speech synthesis BEFORE module loads — critical for LG WebOS and some browsers.
+  // Module scripts are deferred; this plain script runs immediately and caches voices.
+  window._ttsVoicesReady = false;
+  if (window.speechSynthesis) {
+    var _loadVoices = function() {
+      var v = window.speechSynthesis.getVoices();
+      if (v && v.length) window._ttsVoicesReady = true;
+    };
+    _loadVoices();
+    window.speechSynthesis.onvoiceschanged = _loadVoices;
+    // Some LG TVs need a dummy utterance to unlock TTS
+    window.addEventListener("click", function _unlock() {
+      window.removeEventListener("click", _unlock);
+      var u = new SpeechSynthesisUtterance(" ");
+      u.volume = 0;
+      window.speechSynthesis.speak(u);
+      _loadVoices();
+    }, { once: true });
+  }
+</script>
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
@@ -37,8 +58,6 @@ const firebaseConfig = {
   // Adjust BASE_URL to wherever you host the files
   const BASE_URL = new URL("buzzer.html", window.location.href).toString();
     let prevPhase = null, prevBuzzers = null, cachedTeams = [];
-  let speechVoices = [];
-
   // ==================== AUDIO ====================
   function beep(type) {
     try {
@@ -54,42 +73,47 @@ const firebaseConfig = {
     } catch(e) {}
   }
 
-        let ttsLastKey = "";
-
-      function tts(text) {
+  // ---- TTS: robust cross-browser including LG WebOS ----
+  // Pre-load voices as soon as possible (must happen outside module scope issue)
+  function tts(text) {
     if (!window.speechSynthesis || !text) return;
-
     const synth = window.speechSynthesis;
-    const voices = speechVoices.length ? speechVoices : (synth.getVoices() || []);
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 0.9;
 
-    const hasTamil = /[\u0B80-\u0BFF]/.test(text);
-    let voice = null;
+    function doSpeak() {
+      const voices = synth.getVoices() || [];
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 0.85;
+      u.volume = 1;
+      u.pitch = 1;
 
-    if (hasTamil) {
-      voice =
-        voices.find(v => (v.lang || "").toLowerCase().startsWith("ta")) ||
-        voices.find(v => (v.name || "").toLowerCase().includes("tamil"));
+      // Pick best available voice: Tamil → English → first available
+      const voice =
+        voices.find(v => /^ta/i.test(v.lang)) ||
+        voices.find(v => /^en/i.test(v.lang)) ||
+        voices[0] || null;
+
+      if (voice) {
+        u.voice = voice;
+        u.lang  = voice.lang;
+      } else {
+        u.lang = "en-US";
+      }
+
+      // LG WebOS fix: cancel must settle before speak
+      synth.cancel();
+      setTimeout(() => synth.speak(u), 50);
     }
 
-    if (!voice) {
-      voice = voices.find(v => (v.lang || "").toLowerCase().startsWith("en"));
-    }
-
-    if (!voice) {
-      voice = voices[0] || null;
-    }
-
-    if (voice) {
-      u.voice = voice;
-      u.lang = voice.lang || "en-US";
+    // If voices already loaded, speak immediately
+    const voices = synth.getVoices() || [];
+    if (voices.length > 0) {
+      doSpeak();
     } else {
-      u.lang = hasTamil ? "ta-IN" : "en-US";
+      // Wait for voices to load (needed on first call on many browsers)
+      synth.onvoiceschanged = () => { synth.onvoiceschanged = null; doSpeak(); };
+      // Hard fallback after 1s in case onvoiceschanged never fires (LG bug)
+      setTimeout(() => { if (!synth.speaking) doSpeak(); }, 1000);
     }
-
-    synth.cancel();
-    synth.speak(u);
   }
 
   // ---- Main listener ----
@@ -319,12 +343,7 @@ const firebaseConfig = {
     qs("#screen-lobby").style.display = "flex";
     qs("#lobby-code").textContent = "Connecting...";
 
-    if (window.speechSynthesis) {
-      speechVoices = window.speechSynthesis.getVoices() || [];
-      window.speechSynthesis.onvoiceschanged = () => {
-        speechVoices = window.speechSynthesis.getVoices() || [];
-      };
-    }
+    // TTS voices pre-warmed by inline script above
   });
 </script>
 
