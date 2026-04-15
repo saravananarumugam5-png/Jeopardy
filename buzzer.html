@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Tamil Jeopardy — Buzzer</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Rajdhani:wght@500;700&display=swap" rel="stylesheet">
+
+<!-- ============================================================
+     STEP 1: Paste your Firebase config below.
+     Same config as admin.html and tv.html.
+     ============================================================ -->
+<script type="module">
+  import { initializeApp }  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, onValue, set, update, get } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyAdpQJ_-rYt5UsO3M5fMSTHkHblXbO8884",
+  authDomain: "home-jeopardy-53a9c.firebaseapp.com",
+  databaseURL: "https://home-jeopardy-53a9c-default-rtdb.firebaseio.com",
+  projectId: "home-jeopardy-53a9c",
+  storageBucket: "home-jeopardy-53a9c.firebasestorage.app",
+  messagingSenderId: "815858138181",
+  appId: "1:815858138181:web:eb37ed6a55e3f5747bb72c",
+  measurementId: "G-LECJDJTH7Y"
+};
+  // ============================================================
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+  // ---- Read URL params ----
+  const params   = new URLSearchParams(window.location.search);
+  const myTeamId = params.get("team");
+  const myPin    = params.get("pin");
+  const myCode   = params.get("code");
+
+  let myTeam    = null;   // team object from Firebase
+  let gameState = null;   // full game snapshot
+  let joined    = false;  // has user confirmed join?
+  let lastBuzzersState = null;
+
+  // ---- Connection tracking ----
+  const connRef = ref(db, ".info/connected");
+  const qs = s => document.querySelector(s);
+
+  onValue(connRef, snap => {
+    const online = snap.val();
+    const dot = qs("#conn-dot");
+    const lbl = qs("#conn-label");
+    if (!dot || !lbl) return;
+    dot.className  = "conn-dot "+(online?"on":"off");
+    lbl.textContent = online ? "Connected" : "Reconnecting…";
+  });
+
+  // ---- If no team params → show manual PIN entry ----
+  if (!myTeamId || !myPin) {
+    document.addEventListener("DOMContentLoaded", showPinEntry);
+  } else {
+    document.addEventListener("DOMContentLoaded", () => {
+      showConfirmScreen();
+      subscribeToGame();
+    });
+  }
+
+  function subscribeToGame() {
+    onValue(ref(db,"game"), snap => {
+      const G = snap.val();
+      if (!G) return;
+      gameState = G;
+      // Find our team
+      myTeam = (G.teams||[]).find(t => t.id===myTeamId);
+      if (joined) updateBuzzerUI(G);
+    });
+  }
+
+  // ==================== JOIN FLOW ====================
+
+  function showPinEntry() {
+    qs("#screen-confirm").style.display = "none";
+    qs("#screen-pin").style.display     = "flex";
+  }
+
+  function showConfirmScreen() {
+    qs("#screen-pin").style.display     = "none";
+    qs("#screen-confirm").style.display = "flex";
+    // We'll populate once we have game data
+    onValue(ref(db,"game"), snap => {
+      const G = snap.val();
+      if (!G) return;
+      const team = (G.teams||[]).find(t => t.id===myTeamId && t.pin===myPin);
+      if (!team) {
+        qs("#confirm-team-name").textContent = "Team not found";
+        qs("#confirm-pin").textContent = "Check your QR code or PIN";
+        return;
+      }
+      qs("#confirm-team-name").textContent = team.name;
+      qs("#confirm-team-name").style.color = team.color;
+      qs("#confirm-pin").textContent = "PIN: "+team.pin;
+    }, { onlyOnce: true });
+  }
+
+  window.joinByPin = async function() {
+    const pin = qs("#pin-input").value.trim();
+    const snap = await get(ref(db,"game"));
+    const G = snap.val();
+    if (!G) { alert("No active game found."); return; }
+    const team = (G.teams||[]).find(t => t.pin===pin);
+    if (!team) { qs("#pin-msg").textContent = "PIN not found. Try again."; return; }
+    // Redirect to confirm with params
+    window.location.href = `buzzer.html?team=${team.id}&pin=${team.pin}&code=${G.gameCode}`;
+  };
+
+  window.confirmYes = function() {
+  joined = true;
+
+  const joinedKey = `tj_joined_${myCode || "default"}_${myTeamId}`;
+  if (!sessionStorage.getItem(joinedKey)) {
+    const snap_ref = ref(db,"game/teams");
+    get(snap_ref).then(snap => {
+      const teams = snap.val()||[];
+      const idx   = teams.findIndex(t=>t.id===myTeamId);
+      if (idx >= 0) {
+        teams[idx].connected = (teams[idx].connected||0)+1;
+        set(snap_ref, teams).then(() => {
+          sessionStorage.setItem(joinedKey, "1");
+        });
+      }
+    });
+  }
+
+  qs("#screen-confirm").style.display = "none";
+  qs("#screen-buzzer").style.display  = "flex";
+  if (gameState) {
+    myTeam = (gameState.teams||[]).find(t=>t.id===myTeamId);
+    qs("#bz-team-name").textContent = myTeam?.name || "—";
+    qs("#bz-team-name").style.color = myTeam?.color || "#FFD700";
+    qs("#bz-game-code").textContent = "Game: "+(myCode||gameState.gameCode||"—");
+    updateBuzzerUI(gameState);
+  }
+  if (!gameState) subscribeToGame();
+};
+
+  window.confirmNo = function() {
+    window.location.href = "buzzer.html";
+  };
+
+  // ==================== BUZZER UI ====================
+
+  function updateBuzzerUI(G) {
+    if (!myTeamId) return;
+
+    const buzzers  = G.buzzers;
+    const buzzOrder = G.buzzOrder||[];
+    const locked   = G.lockedTeams||[];
+    const phase    = G.phase;
+
+    // Update team info
+    if (myTeam) {
+      qs("#bz-team-name").textContent = myTeam.name;
+      qs("#bz-team-name").style.color = myTeam.color;
+    }
+
+    // Determine our state
+    let uiState = "waiting";
+
+    if (phase === "lobby") {
+      uiState = "lobby";
+    } else if (phase === "board") {
+      uiState = "waiting";
+    } else if (phase === "clue" || phase === "answer") {
+      const myBuzzed  = buzzOrder.some(b => (b.teamId||b) === myTeamId);
+      const myLocked  = locked.includes(myTeamId);
+      const firstBuzz = buzzOrder[0] ? (buzzOrder[0].teamId||buzzOrder[0]) : null;
+      const iFirst    = firstBuzz === myTeamId;
+
+      if (myLocked) {
+        uiState = "out";
+      } else if (iFirst && myBuzzed) {
+        uiState = "buzzed";
+      } else if (myBuzzed) {
+        uiState = "next";
+      } else if (phase === "answer") {
+        uiState = "waiting";
+      } else if (buzzers === "open") {
+        uiState = "live";
+      } else if (buzzOrder.length > 0) {
+        uiState = "other";
+      } else {
+        uiState = "listening";
+      }
+    } else if (phase === "ended") {
+      uiState = "ended";
+    }
+
+    // Vibrate when going live
+    if (uiState === "live" && lastBuzzersState !== "live") {
+      if (navigator.vibrate) navigator.vibrate([200,60,200]);
+      playSound("open");
+    }
+    lastBuzzersState = uiState;
+
+    applyUIState(uiState);
+  }
+
+  function applyUIState(state) {
+    const btn = qs("#buzz-btn");
+    const msg = qs("#bz-msg");
+    if (!btn || !msg) return;
+
+    btn.className    = "buzz-btn";
+    btn.disabled     = true;
+    btn.dataset.state = state;
+
+    switch(state) {
+      case "lobby":
+        btn.classList.add("s-wait");
+        msg.textContent = "Waiting for host to start…";
+        break;
+      case "waiting":
+        btn.classList.add("s-wait");
+        msg.textContent = "Waiting for next question…";
+        break;
+      case "listening":
+        btn.classList.add("s-listen");
+        msg.textContent = "Listening… Buzzer opens soon!";
+        break;
+      case "live":
+        btn.classList.add("s-live");
+        btn.disabled = false;
+        msg.textContent = "TAP TO BUZZ!";
+        break;
+      case "buzzed":
+        btn.classList.add("s-buzzed");
+        msg.textContent = "You buzzed first!";
+        playSound("buzz");
+        break;
+      case "next":
+        btn.classList.add("s-next");
+        msg.textContent = "You're next — stand by!";
+        break;
+      case "out":
+        btn.classList.add("s-out");
+        msg.textContent = "Your team is out for this question.";
+        break;
+      case "other":
+        btn.classList.add("s-other");
+        msg.textContent = "Another team buzzed…";
+        break;
+      case "ended":
+        btn.classList.add("s-wait");
+        msg.textContent = "Game over! Great playing!";
+        break;
+    }
+  }
+
+  // ==================== BUZZ ACTION ====================
+  window.doBuzz = function() {
+    if (!gameState || gameState.buzzers !== "open") return;
+    if (!myTeamId) return;
+    const locked = gameState.lockedTeams||[];
+    if (locked.includes(myTeamId)) return;
+    // Already buzzed?
+    const bo = gameState.buzzOrder||[];
+    if (bo.some(b=>(b.teamId||b)===myTeamId)) return;
+
+    // Optimistic UI
+    applyUIState("buzzed");
+    if (navigator.vibrate) navigator.vibrate(100);
+
+    // Write to Firebase
+    const newEntry = { teamId: myTeamId, time: Date.now() };
+    const updated  = [...bo, newEntry];
+    set(ref(db,"game/buzzOrder"), updated).catch(() => {
+      // Revert if write failed
+      if (gameState) updateBuzzerUI(gameState);
+    });
+  };
+
+  // ==================== SOUNDS ====================
+  function playSound(type) {
+    try {
+      const ctx = new (window.AudioContext||window.webkitAudioContext)();
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      const t = ctx.currentTime;
+      if (type==="open") {
+        o.frequency.setValueAtTime(700,t);
+        o.frequency.setValueAtTime(1000,t+0.1);
+        g.gain.setValueAtTime(0.5,t);
+        g.gain.exponentialRampToValueAtTime(0.001,t+0.5);
+      }
+      if (type==="buzz") {
+        o.frequency.setValueAtTime(1200,t);
+        g.gain.setValueAtTime(0.6,t);
+        g.gain.exponentialRampToValueAtTime(0.001,t+0.2);
+      }
+      o.start(t); o.stop(t+0.7);
+    } catch(e) {}
+  }
+</script>
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+:root{
+  --gold:#FFD700;
+  --bg:#000;
+  --green:#00C853;--red:#CC0000;--amber:#FFA500;
+}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);}
+body{font-family:'Rajdhani',sans-serif;color:#fff;touch-action:manipulation;}
+
+/* All screens full-viewport */
+.screen{
+  position:fixed;inset:0;
+  display:none;flex-direction:column;
+  align-items:center;justify-content:center;
+  padding:24px;text-align:center;
+  background:var(--bg);
+}
+
+/* ===== PIN ENTRY ===== */
+#screen-pin{gap:16px;}
+.pin-title{font-family:'Bebas Neue',sans-serif;font-size:40px;color:var(--gold);letter-spacing:4px;}
+#pin-input{
+  font-size:32px;text-align:center;letter-spacing:8px;
+  background:rgba(255,255,255,.08);border:2px solid rgba(255,215,0,.4);
+  color:#fff;border-radius:10px;padding:12px 20px;width:220px;
+  font-family:'Bebas Neue',sans-serif;
+}
+#pin-input:focus{outline:none;border-color:var(--gold);}
+.pin-btn{
+  font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:3px;
+  padding:12px 36px;border:2px solid var(--green);border-radius:10px;
+  background:rgba(0,200,83,.15);color:var(--green);cursor:pointer;
+}
+.pin-btn:hover{background:rgba(0,200,83,.28);}
+#pin-msg{font-size:14px;color:#ff6b6b;min-height:18px;}
+
+/* ===== CONFIRM ===== */
+#screen-confirm{gap:16px;}
+.confirm-label{font-size:16px;color:#8899dd;letter-spacing:1px;}
+#confirm-team-name{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(36px,10vw,64px);
+  color:var(--gold);letter-spacing:4px;
+}
+#confirm-pin{font-size:16px;color:#8899dd;margin-bottom:8px;}
+.confirm-q{font-size:18px;color:#ccc;margin-bottom:20px;}
+.cfm-btns{display:flex;flex-direction:column;gap:10px;width:100%;max-width:280px;}
+.cfm-btn{
+  font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:3px;
+  padding:14px;border-radius:10px;border:2px solid;cursor:pointer;
+  transition:all .2s;
+}
+.cfm-btn.yes{border-color:var(--green);background:rgba(0,200,83,.15);color:var(--green);}
+.cfm-btn.yes:hover{background:rgba(0,200,83,.3);}
+.cfm-btn.no{border-color:#444;background:transparent;color:#666;}
+.cfm-btn.no:hover{background:rgba(255,255,255,.05);}
+
+/* ===== BUZZER ===== */
+#screen-buzzer{gap:0;justify-content:space-between;padding:32px 24px;}
+
+.bz-top{text-align:center;padding-top:8px;}
+#bz-team-name{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(30px,10vw,56px);
+  color:var(--gold);letter-spacing:4px;line-height:1;
+}
+#bz-game-code{font-size:12px;color:#444;margin-top:2px;}
+
+.bz-mid{
+  display:flex;align-items:center;justify-content:center;
+  flex:1;
+}
+
+/* THE BIG BUTTON */
+.buzz-btn{
+  width:min(300px,78vw);
+  height:min(300px,78vw);
+  border-radius:50%;
+  border:6px solid;
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(32px,10vw,52px);
+  letter-spacing:4px;
+  cursor:pointer;
+  user-select:none;
+  transition:transform .08s, box-shadow .15s;
+  position:relative;
+  overflow:hidden;
+}
+.buzz-btn:active:not(:disabled){transform:scale(.93);}
+
+/* Ripple */
+.buzz-btn::after{
+  content:'';
+  position:absolute;inset:0;border-radius:50%;
+  background:rgba(255,255,255,.18);
+  opacity:0;transition:opacity .3s;
+}
+.buzz-btn:active:not(:disabled)::after{opacity:1;}
+
+/* States */
+.buzz-btn.s-wait{
+  background:#0a0a0a;border-color:#1a1a1a;color:#222;
+}
+.buzz-btn.s-listen{
+  background:#0c0c20;border-color:#2a2a60;color:#3a3a80;
+  animation:listenPulse 1.8s infinite;
+}
+@keyframes listenPulse{0%,100%{border-color:#2a2a60}50%{border-color:#5555bb}}
+
+.buzz-btn.s-live{
+  background:#8b0000;
+  border-color:#ff2222;
+  color:#fff;
+  box-shadow:0 0 50px rgba(255,40,40,.55),0 0 100px rgba(255,40,40,.2);
+  animation:livePulse .9s infinite;
+}
+@keyframes livePulse{
+  0%,100%{box-shadow:0 0 50px rgba(255,40,40,.55),0 0 100px rgba(255,40,40,.2)}
+  50%{box-shadow:0 0 70px rgba(255,40,40,.85),0 0 140px rgba(255,40,40,.4)}
+}
+
+.buzz-btn.s-buzzed{
+  background:#002800;border-color:var(--green);color:var(--green);
+  box-shadow:0 0 40px rgba(0,200,83,.3);
+}
+.buzz-btn.s-next{
+  background:#1a1200;border-color:var(--amber);color:var(--amber);
+  animation:nextPulse 1.1s infinite;
+}
+@keyframes nextPulse{0%,100%{border-color:#FFA500}50%{border-color:#FFD700}}
+
+.buzz-btn.s-out{
+  background:#110000;border-color:#330000;color:#330000;
+}
+.buzz-btn.s-other{
+  background:#0a0a0a;border-color:#1a1a1a;color:#1a1a1a;
+}
+
+.bz-bot{text-align:center;padding-bottom:8px;}
+#bz-msg{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(16px,5vw,24px);
+  letter-spacing:2px;color:#888;
+  min-height:32px;margin-bottom:16px;
+}
+
+/* Connection indicator */
+.conn-row{display:flex;align-items:center;justify-content:center;gap:6px;}
+.conn-dot{width:8px;height:8px;border-radius:50%;}
+.conn-dot.on{background:#00C853;}
+.conn-dot.off{background:#ff6b6b;animation:pulse 1s infinite;}
+#conn-label{font-size:12px;color:#444;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+</style>
+</head>
+<body>
+
+<!-- PIN ENTRY (no URL params) -->
+<div class="screen" id="screen-pin" style="display:flex;">
+  <div class="pin-title">TAMIL JEOPARDY</div>
+  <div style="font-size:16px;color:#8899dd;">Enter your team PIN</div>
+  <input type="number" id="pin-input" placeholder="1234" maxlength="4" inputmode="numeric">
+  <button class="pin-btn" onclick="joinByPin()">JOIN GAME</button>
+  <div id="pin-msg"></div>
+</div>
+
+<!-- CONFIRM TEAM -->
+<div class="screen" id="screen-confirm">
+  <div class="confirm-label">YOU ARE JOINING</div>
+  <div id="confirm-team-name">—</div>
+  <div id="confirm-pin"></div>
+  <div class="confirm-q">Is this your team?</div>
+  <div class="cfm-btns">
+    <button class="cfm-btn yes" onclick="confirmYes()">Yes, that's me!</button>
+    <button class="cfm-btn no"  onclick="confirmNo()">No, scan again</button>
+  </div>
+</div>
+
+<!-- BUZZER -->
+<div class="screen" id="screen-buzzer">
+  <div class="bz-top">
+    <div id="bz-team-name">—</div>
+    <div id="bz-game-code"></div>
+  </div>
+
+  <div class="bz-mid">
+    <button class="buzz-btn s-wait" id="buzz-btn" onclick="doBuzz()" disabled>
+      BUZZ!
+    </button>
+  </div>
+
+  <div class="bz-bot">
+    <div id="bz-msg">Waiting for host…</div>
+    <div class="conn-row">
+      <div class="conn-dot off" id="conn-dot"></div>
+      <span id="conn-label">Connecting…</span>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tamil Jeopardy — TV Display</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Rajdhani:wght@400;600;700&family=Noto+Sans+Tamil:wght@400;700&display=swap" rel="stylesheet">
+
+<!-- ============================================================
+     STEP 1: Paste your Firebase config below.
+     Same config as admin.html and buzzer.html.
+     ============================================================ -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyAdpQJ_-rYt5UsO3M5fMSTHkHblXbO8884",
+  authDomain: "home-jeopardy-53a9c.firebaseapp.com",
+  databaseURL: "https://home-jeopardy-53a9c-default-rtdb.firebaseio.com",
+  projectId: "home-jeopardy-53a9c",
+  storageBucket: "home-jeopardy-53a9c.firebasestorage.app",
+  messagingSenderId: "815858138181",
+  appId: "1:815858138181:web:eb37ed6a55e3f5747bb72c",
+  measurementId: "G-LECJDJTH7Y"
+};
+  // ============================================================
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+
+
+  // ---- QR code generation (for lobby) ----
+  // We generate QR URLs pointing to buzzer.html with team params
+  // Adjust BASE_URL to wherever you host the files
+  const BASE_URL = new URL("buzzer.html", window.location.href).toString();
+    let prevPhase = null, prevBuzzers = null, cachedTeams = [];
+  let speechVoices = [];
+
+  // ==================== AUDIO ====================
+  function beep(type) {
+    try {
+      const ctx = new (window.AudioContext||window.webkitAudioContext)();
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      const t = ctx.currentTime;
+      if (type==="open")    { o.frequency.setValueAtTime(880,t); o.frequency.setValueAtTime(1100,t+0.12); g.gain.setValueAtTime(0.4,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.6); }
+      if (type==="correct") { o.type="triangle"; [523,659,784].forEach((f,i)=>o.frequency.setValueAtTime(f,t+i*0.13)); g.gain.setValueAtTime(0.5,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.8); }
+      if (type==="wrong")   { o.frequency.setValueAtTime(220,t); o.frequency.linearRampToValueAtTime(90,t+0.5); g.gain.setValueAtTime(0.5,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.6); }
+      if (type==="buzz")    { o.frequency.setValueAtTime(1100,t); g.gain.setValueAtTime(0.6,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.25); }
+      o.start(t); o.stop(t+1.0);
+    } catch(e) {}
+  }
+
+        let ttsLastKey = "";
+
+      function tts(text) {
+    if (!window.speechSynthesis || !text) return;
+
+    const synth = window.speechSynthesis;
+    const voices = speechVoices.length ? speechVoices : (synth.getVoices() || []);
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.9;
+
+    const hasTamil = /[\u0B80-\u0BFF]/.test(text);
+    let voice = null;
+
+    if (hasTamil) {
+      voice =
+        voices.find(v => (v.lang || "").toLowerCase().startsWith("ta")) ||
+        voices.find(v => (v.name || "").toLowerCase().includes("tamil"));
+    }
+
+    if (!voice) {
+      voice = voices.find(v => (v.lang || "").toLowerCase().startsWith("en"));
+    }
+
+    if (!voice) {
+      voice = voices[0] || null;
+    }
+
+    if (voice) {
+      u.voice = voice;
+      u.lang = voice.lang || "en-US";
+    } else {
+      u.lang = hasTamil ? "ta-IN" : "en-US";
+    }
+
+    synth.cancel();
+    synth.speak(u);
+  }
+
+  // ---- Main listener ----
+  let prevClueKey = null;
+  onValue(ref(db,"game"), snap => {
+    const G = snap.val();
+    if (!G) return;
+    cachedTeams = G.teams || [];
+
+       // Track clue changes only — TV speech comes from admin ttsRequest
+    const clueKey = G.activeClue ? G.activeClue.catIdx+"_"+G.activeClue.clueIdx : null;
+    prevClueKey = clueKey;
+
+    // Buzzers just opened
+    if (G.buzzers === "open" && prevBuzzers !== "open") beep("open");
+
+    // First buzz came in
+    const bo = G.buzzOrder||[];
+    if (bo.length === 1 && prevBuzzers === "open") beep("buzz");
+
+    render(G);
+    prevPhase   = G.phase;
+    prevBuzzers = G.buzzers;
+  });
+
+    // Manual read-aloud triggered from admin
+  let lastTtsTime = 0;
+  onValue(ref(db,"game/ttsRequest"), snap => {
+    const r = snap.val();
+    if (!r || !r.time || r.time === lastTtsTime) return;
+    lastTtsTime = r.time;
+    tts(r.text, "ttsRequest_" + r.time);
+  });
+
+  // ---- Listen to lastResult for result overlay ----
+  let lastResultTime = 0;
+  onValue(ref(db,"game/lastResult"), snap => {
+    const r = snap.val();
+    if (!r || !r.updatedAt || r.updatedAt === lastResultTime) return;
+    lastResultTime = r.updatedAt;
+    if (r.result === "correct") beep("correct");
+    else beep("wrong");
+    showResultOverlay(r.result, r.winnerTeamId, cachedTeams);
+  });
+
+  // ---- Render dispatcher ----
+  function render(G) {
+    hideAll();
+    if      (G.phase === "lobby")  renderLobby(G);
+    else if (G.phase === "board")  renderBoard(G);
+    else if (G.phase === "clue")   renderClue(G);
+    else if (G.phase === "answer") renderAnswer(G);
+    else if (G.phase === "ended")  renderEnded(G);
+  }
+
+  function hideAll() {
+    qs("#screen-lobby").style.display  = "none";
+    qs("#screen-board").style.display  = "none";
+    qs("#screen-clue").style.display   = "none";
+    qs("#screen-answer").style.display = "none";
+    qs("#screen-ended").style.display  = "none";
+  }
+
+  // ==================== LOBBY ====================
+  function renderLobby(G) {
+    qs("#screen-lobby").style.display = "flex";
+    qs("#lobby-code").textContent = G.gameCode || "——";
+    const title = G.gameName || "Tamil Jeopardy";
+    qs("#lobby-title").textContent = title;
+    document.title = title + " — TV";
+
+    const grid = qs("#lobby-teams");
+    grid.innerHTML = "";
+    (G.teams||[]).forEach(t => {
+      const card = el("div","team-card");
+      const joinURL = `${BASE_URL}?team=${t.id}&pin=${t.pin}&code=${G.gameCode}`;
+      const qrSrc   = `https://api.qrserver.com/v1/create-qr-code/?size=140x140&margin=6&data=${encodeURIComponent(joinURL)}`;
+      card.innerHTML = `
+        <div class="tc-name" style="color:${t.color}">${t.name}</div>
+        <div class="tc-pin">PIN: ${t.pin}</div>
+        <img src="${qrSrc}" width="140" height="140" class="tc-qr" alt="QR code for ${t.name}">
+        <div class="tc-joined" id="joined-${t.id}">${(t.connected||0)>0?"● "+t.connected+" joined":"Waiting..."}</div>`;
+      grid.appendChild(card);
+    });
+  }
+
+  // ==================== BOARD ====================
+  function renderBoard(G) {
+    qs("#screen-board").style.display = "flex";
+    renderScoreStrip("#board-scores", G);
+
+    const grid = qs("#board-grid");
+    const n = (G.board||[]).length;
+    if (!n) { grid.innerHTML = ""; return; }
+    grid.style.gridTemplateColumns = `repeat(${n},1fr)`;
+    grid.innerHTML = "";
+
+    G.board.forEach(c => {
+      const h = el("div","cat-head"); h.textContent = c.cat; grid.appendChild(h);
+    });
+    const rows = G.board[0].clues.length;
+    for (let r=0; r<rows; r++) {
+      G.board.forEach(c => {
+        const cl = c.clues[r];
+        const t = el("div","b-tile"+(cl.used?" used":""));
+        t.textContent = "$"+cl.value;
+        grid.appendChild(t);
+      });
+    }
+    // Picker
+    const picker = (G.teams||[]).find(t=>t.id===G.pickerTeamId);
+    qs("#board-picker").textContent = picker ? "🎯 "+picker.name+" picks next" : "";
+    qs("#board-title").textContent = G.gameName || "Tamil Jeopardy";
+  }
+
+  // ==================== CLUE ====================
+  function renderClue(G) {
+    qs("#screen-clue").style.display = "flex";
+    const cl = G.activeClue;
+    if (!cl) return;
+    qs("#clue-cat").textContent  = cl.cat;
+    qs("#clue-val").textContent  = "$"+cl.value;
+    qs("#clue-text").textContent = cl.q;
+
+    const buzzOpen = G.buzzers === "open";
+    const bo = G.buzzOrder||[];
+    const locked = G.lockedTeams||[];
+
+    if (bo.length > 0) {
+      const firstId = bo[0].teamId || bo[0];
+      const team = (G.teams||[]).find(t=>t.id===firstId);
+      qs("#clue-buzz-status").textContent = (team?.name||"A team") + " BUZZED!";
+      qs("#clue-buzz-status").className = "buzz-status buzzed";
+    } else if (buzzOpen) {
+      qs("#clue-buzz-status").textContent = "BUZZERS LIVE!";
+      qs("#clue-buzz-status").className = "buzz-status open";
+    } else {
+      qs("#clue-buzz-status").textContent = "BUZZERS CLOSED";
+      qs("#clue-buzz-status").className = "buzz-status closed";
+    }
+
+    // Buzz order list
+    const boList = qs("#clue-buzz-order");
+    boList.innerHTML = "";
+    bo.forEach((b, i) => {
+      const tid = b.teamId || b;
+      const team = (G.teams||[]).find(t=>t.id===tid);
+      const isLocked = locked.includes(tid);
+      const span = document.createElement("span");
+      span.className = "bo-tag" + (isLocked ? " bo-locked" : i===0 ? " bo-first" : "");
+      span.textContent = (i+1)+". "+(team?.name||tid);
+      boList.appendChild(span);
+    });
+
+    renderScoreStrip("#clue-scores", G);
+  }
+
+  // ==================== ANSWER ====================
+  function renderAnswer(G) {
+    qs("#screen-answer").style.display = "flex";
+    const cl = G.activeClue;
+    qs("#answer-text").textContent = cl ? cl.a : "—";
+    renderScoreStrip("#answer-scores", G);
+  }
+
+  let lastResultShown = null;
+  function showResultOverlay(result, winnerTeamId, teams) {
+    const overlay = qs("#result-overlay");
+    const label   = qs("#result-label");
+    const teamEl  = qs("#result-team");
+    if (!overlay) return;
+    if (result === "correct") {
+      overlay.className = "result-overlay correct";
+      label.textContent = "✓ CORRECT!";
+      const team = (teams||[]).find(t=>t.id===winnerTeamId);
+      teamEl.textContent = team ? team.name : "";
+      teamEl.style.color = team ? team.color : "#fff";
+    } else {
+      overlay.className = "result-overlay nobody";
+      label.textContent = "TIME'S UP";
+      teamEl.textContent = "";
+    }
+    overlay.style.display = "flex";
+    // Auto-hide after 2.5s (answer screen stays, overlay fades)
+    setTimeout(() => { overlay.style.display = "none"; }, 2500);
+  }
+
+  // ==================== ENDED ====================
+  function renderEnded(G) {
+    qs("#screen-ended").style.display = "flex";
+    const sorted = [...(G.teams||[])].sort((a,b)=>b.score-a.score);
+    const winner = sorted[0];
+    qs("#winner-name").textContent = winner?.name || "—";
+    qs("#winner-name").style.color = winner?.color || "#FFD700";
+
+    const fs = qs("#final-scores");
+    fs.innerHTML = "";
+    sorted.forEach((t,i) => {
+      const card = el("div","fs-card"+(i===0?" champ":""));
+      card.innerHTML = `<div class="fs-pos">${i===0?"🏆":i+1}</div>
+        <div class="fs-name" style="color:${t.color}">${t.name}</div>
+        <div class="fs-score">${t.score}</div>`;
+      fs.appendChild(card);
+    });
+  }
+
+  // ==================== SHARED ====================
+  function renderScoreStrip(selector, G) {
+    const strip = qs(selector);
+    if (!strip) return;
+    strip.innerHTML = "";
+    (G.teams||[]).forEach(t => {
+      const div = el("div","score-cell"+(t.id===G.pickerTeamId?" picks":"")+(t.score<0?" neg":""));
+      div.innerHTML = `
+        ${t.id===G.pickerTeamId?'<span class="picks-badge">PICKS</span>':""}
+        <div class="sc-name" style="color:${t.color}">${t.name}</div>
+        <div class="sc-score">${t.score}</div>`;
+      strip.appendChild(div);
+    });
+  }
+
+  const qs = s => document.querySelector(s);
+  function el(tag,cls){ const e=document.createElement(tag); if(cls) e.className=cls; return e; }
+
+    document.addEventListener("DOMContentLoaded", () => {
+    // Show connecting state
+    qs("#screen-lobby").style.display = "flex";
+    qs("#lobby-code").textContent = "Connecting...";
+
+    if (window.speechSynthesis) {
+      speechVoices = window.speechSynthesis.getVoices() || [];
+      window.speechSynthesis.onvoiceschanged = () => {
+        speechVoices = window.speechSynthesis.getVoices() || [];
+      };
+    }
+  });
+</script>
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --gold:#FFD700;--gold2:#b8960c;
+  --bg:#04082a;--bg2:#0b1240;
+  --green:#00C853;--red:#D32F2F;
+}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);}
+body{font-family:'Rajdhani','Noto Sans Tamil',sans-serif;color:#fff;}
+
+/* All screens are full-viewport */
+.screen{
+  position:fixed;inset:0;
+  display:none;flex-direction:column;
+  background:var(--bg);
+}
+
+/* ===== LOBBY ===== */
+#screen-lobby{
+  align-items:center;justify-content:center;gap:20px;
+  background:radial-gradient(ellipse at 50% 30%, #0d2080 0%, #04082a 70%);
+  padding:32px;text-align:center;
+}
+.lobby-title{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(52px,9vw,110px);
+  color:var(--gold);letter-spacing:8px;
+  text-shadow:0 0 60px rgba(255,215,0,0.3);
+  line-height:1;
+}
+.lobby-sub{font-size:clamp(14px,2vw,22px);color:#8899dd;margin-top:-8px;}
+.lobby-code-wrap{margin:4px 0;}
+.lobby-code-label{font-size:clamp(18px,2.5vw,30px);color:#8899dd;letter-spacing:4px;font-family:'Bebas Neue',sans-serif;font-weight:700;}
+.lobby-code{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(48px,7vw,80px);
+  color:#fff;letter-spacing:14px;
+  background:rgba(255,215,0,0.1);
+  border:3px solid var(--gold);
+  border-radius:10px;padding:4px 28px;
+  display:inline-block;
+}
+#lobby-teams{display:flex;gap:20px;flex-wrap:wrap;justify-content:center;max-width:1100px;}
+.team-card{
+  background:rgba(255,255,255,0.06);
+  border:2px solid rgba(255,215,0,0.35);
+  border-radius:14px;padding:16px 20px;
+  text-align:center;min-width:170px;
+}
+.tc-name{font-size:clamp(16px,2vw,22px);font-weight:700;margin-bottom:4px;}
+.tc-pin{font-size:clamp(16px,2vw,24px);color:#aab4ff;margin-bottom:12px;font-weight:700;letter-spacing:2px;}
+.tc-qr{display:block;margin:0 auto 10px;border:3px solid #fff;border-radius:6px;}
+.tc-joined{font-size:13px;color:#69ff9c;min-height:18px;}
+.lobby-waiting{font-size:clamp(12px,1.5vw,18px);color:#8899dd;animation:pulse 2s infinite;}
+
+/* ===== BOARD ===== */
+#screen-board{background:var(--bg);}
+.score-strip{
+  display:flex;background:#000;
+  border-bottom:3px solid var(--gold);
+  flex-shrink:0;
+}
+.score-cell{
+  flex:1;padding:8px 12px;text-align:center;
+  border-right:1px solid rgba(255,215,0,0.15);
+  position:relative;
+}
+.score-cell:last-child{border-right:none;}
+.score-cell.picks{background:rgba(255,215,0,0.1);}
+.sc-name{font-size:clamp(11px,1.6vw,16px);font-weight:700;}
+.sc-score{font-family:'Bebas Neue',sans-serif;font-size:clamp(26px,4vw,48px);color:var(--gold);}
+.score-cell.neg .sc-score{color:#ff6b6b;}
+.picks-badge{
+  position:absolute;top:4px;right:6px;
+  font-size:9px;background:var(--gold);color:#000;
+  padding:1px 5px;border-radius:8px;font-weight:700;
+}
+#board-grid{
+  flex:1;display:grid;gap:5px;padding:6px;overflow:hidden;
+}
+.cat-head{
+  background:var(--bg2);border:2px solid var(--gold);
+  border-radius:6px;display:flex;align-items:center;
+  justify-content:center;text-align:center;
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(13px,2.2vw,28px);
+  color:var(--gold);letter-spacing:1px;
+  padding:8px 4px;min-height:56px;word-break:break-word;
+}
+.b-tile{
+  background:#0c1650;
+  border:2px solid rgba(255,215,0,0.45);
+  border-radius:6px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(22px,4.5vw,62px);
+  color:var(--gold);
+}
+.b-tile.used{background:#080a1a;border-color:rgba(255,255,255,.05);color:#1e2240;text-decoration:line-through;cursor:default;}
+#board-footer{display:flex;align-items:center;justify-content:space-between;padding:6px 16px;font-size:clamp(12px,1.5vw,18px);color:#8899dd;border-top:1px solid rgba(255,215,0,0.15);background:#000;flex-shrink:0;}
+#board-title{font-family:'Bebas Neue',sans-serif;font-size:clamp(14px,2vw,22px);color:rgba(255,215,0,.4);letter-spacing:2px;}
+#board-picker{color:#8899dd;}
+
+/* ===== CLUE ===== */
+#screen-clue{
+  align-items:center;justify-content:center;
+  gap:16px;padding:40px;text-align:center;
+  background:radial-gradient(ellipse at 50% 40%,#0d1b8a 0%,#020930 100%);
+}
+#clue-cat{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(22px,3.5vw,42px);
+  color:var(--gold);letter-spacing:5px;
+}
+#clue-val{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(36px,6vw,80px);
+  color:#fff;
+}
+#clue-text{
+  font-size:clamp(20px,3.8vw,56px);
+  color:#fff;line-height:1.35;
+  max-width:1000px;
+  font-family:'Noto Sans Tamil','Rajdhani',sans-serif;
+}
+.buzz-status{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(18px,2.5vw,34px);
+  letter-spacing:4px;
+}
+.buzz-status.open{color:var(--green);animation:pulse 1s infinite;}
+.buzz-status.closed{color:#8899dd;}
+.buzz-status.buzzed{color:var(--gold);}
+#clue-scores{margin-top:16px;width:100%;max-width:900px;border-radius:10px;overflow:hidden;border:2px solid rgba(255,215,0,0.2);}
+
+/* ===== ANSWER ===== */
+#screen-answer{
+  align-items:center;justify-content:center;
+  gap:20px;padding:40px;text-align:center;
+  background:radial-gradient(ellipse at 50% 40%,#0a2510 0%,#020d04 100%);
+}
+.answer-label{font-family:'Bebas Neue',sans-serif;font-size:clamp(20px,3vw,36px);color:#69ff9c;letter-spacing:4px;}
+#answer-text{
+  font-size:clamp(28px,5.5vw,72px);
+  color:#fff;font-weight:700;
+  font-family:'Noto Sans Tamil','Rajdhani',sans-serif;
+}
+#answer-scores{width:100%;max-width:900px;border-radius:10px;overflow:hidden;border:2px solid rgba(255,215,0,0.2);}
+
+/* ===== ENDED ===== */
+#screen-ended{
+  align-items:center;justify-content:center;gap:24px;
+  padding:40px;text-align:center;
+  background:radial-gradient(ellipse at 50% 40%,#2a1200 0%,#0a0400 100%);
+}
+.ended-title{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(48px,8vw,100px);
+  color:var(--gold);letter-spacing:8px;
+  text-shadow:0 0 60px rgba(255,215,0,0.5);
+}
+#winner-name{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(36px,6vw,80px);
+  letter-spacing:4px;
+}
+#final-scores{display:flex;gap:20px;flex-wrap:wrap;justify-content:center;}
+.fs-card{
+  background:rgba(255,215,0,0.08);
+  border:2px solid rgba(255,215,0,0.3);
+  border-radius:14px;padding:20px 28px;text-align:center;min-width:150px;
+}
+.fs-card.champ{border-color:var(--gold);background:rgba(255,215,0,0.15);}
+.fs-pos{font-size:28px;margin-bottom:4px;}
+.fs-name{font-size:18px;font-weight:700;margin-bottom:4px;}
+.fs-score{font-family:'Bebas Neue',sans-serif;font-size:44px;color:var(--gold);}
+
+/* Buzz order row on clue screen */
+.buzz-order-row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;max-width:900px;}
+.bo-tag{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(14px,2vw,22px);
+  padding:4px 14px;border-radius:20px;letter-spacing:1px;
+  background:rgba(255,255,255,0.08);border:1.5px solid rgba(255,255,255,0.2);color:#ccc;
+}
+.bo-tag.bo-first{background:rgba(255,215,0,0.15);border-color:var(--gold);color:var(--gold);}
+.bo-tag.bo-locked{opacity:0.3;text-decoration:line-through;}
+
+/* Result overlay */
+.result-overlay{
+  position:fixed;inset:0;z-index:100;
+  display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  pointer-events:none;
+  animation:overlayIn .3s ease;
+}
+.result-overlay.correct{background:rgba(0,40,0,0.82);}
+.result-overlay.nobody{background:rgba(10,10,40,0.82);}
+.result-label{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(60px,12vw,140px);
+  letter-spacing:8px;
+  animation:popIn .35s cubic-bezier(0.175,0.885,0.32,1.275);
+}
+.result-overlay.correct .result-label{color:#00C853;}
+.result-overlay.nobody .result-label{color:#8899dd;}
+.result-team{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:clamp(28px,5vw,60px);
+  letter-spacing:4px;margin-top:8px;
+  animation:popIn .4s .1s cubic-bezier(0.175,0.885,0.32,1.275) both;
+}
+@keyframes overlayIn{from{opacity:0}to{opacity:1}}
+@keyframes popIn{from{transform:scale(0.5);opacity:0}to{transform:scale(1);opacity:1}}
+
+/* Utils */
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+</style>
+</head>
+<body>
+
+<!-- LOBBY -->
+<div class="screen" id="screen-lobby">
+  <div class="lobby-title" id="lobby-title">TAMIL JEOPARDY</div>
+  <div class="lobby-sub">Scan your team's QR code to join</div>
+  <div class="lobby-code-wrap">
+    <div class="lobby-code-label">GAME CODE</div>
+    <div class="lobby-code" id="lobby-code">——</div>
+  </div>
+  <div id="lobby-teams"></div>
+  <div class="lobby-waiting">Waiting for host to start…</div>
+</div>
+
+<!-- BOARD -->
+<div class="screen" id="screen-board">
+  <div class="score-strip" id="board-scores"></div>
+  <div id="board-grid"></div>
+  <div id="board-footer">
+    <span id="board-title">Tamil Jeopardy</span>
+    <span id="board-picker"></span>
+  </div>
+</div>
+
+<!-- CLUE -->
+<div class="screen" id="screen-clue">
+  <div id="clue-cat"></div>
+  <div id="clue-val"></div>
+  <div id="clue-text"></div>
+  <div class="buzz-status closed" id="clue-buzz-status">BUZZERS CLOSED</div>
+  <div id="clue-buzz-order" class="buzz-order-row"></div>
+  <div class="score-strip" id="clue-scores" style="border-radius:10px;overflow:hidden;width:100%;max-width:900px;border:2px solid rgba(255,215,0,.2);"></div>
+</div>
+
+<!-- RESULT OVERLAY (shown over answer screen) -->
+<div id="result-overlay" class="result-overlay" style="display:none;">
+  <div id="result-label" class="result-label"></div>
+  <div id="result-team" class="result-team"></div>
+</div>
+
+<!-- ANSWER -->
+<div class="screen" id="screen-answer">
+  <div class="answer-label">THE ANSWER IS…</div>
+  <div id="answer-text"></div>
+  <div class="score-strip" id="answer-scores"></div>
+</div>
+
+<!-- ENDED -->
+<div class="screen" id="screen-ended">
+  <div class="ended-title">🏆 WINNER!</div>
+  <div id="winner-name"></div>
+  <div id="final-scores"></div>
+</div>
+
+</body>
+</html>

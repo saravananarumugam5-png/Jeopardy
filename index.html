@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tamil Jeopardy — Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Rajdhani:wght@400;500;600;700&family=Noto+Sans+Tamil:wght@400;700&display=swap" rel="stylesheet">
+
+<!-- ============================================================
+     STEP 1: Paste your Firebase config below.
+     Go to Firebase Console → Project Settings → Your Apps → SDK setup
+     ============================================================ -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, get, onValue, update, push } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyAdpQJ_-rYt5UsO3M5fMSTHkHblXbO8884",
+  authDomain: "home-jeopardy-53a9c.firebaseapp.com",
+  databaseURL: "https://home-jeopardy-53a9c-default-rtdb.firebaseio.com",
+  projectId: "home-jeopardy-53a9c",
+  storageBucket: "home-jeopardy-53a9c.firebasestorage.app",
+  messagingSenderId: "815858138181",
+  appId: "1:815858138181:web:eb37ed6a55e3f5747bb72c",
+  measurementId: "G-LECJDJTH7Y"
+};
+  // ============================================================
+
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+
+  // ---- Constants ----
+  const TEAM_NAMES  = ["Team 1","Team 2","Team 3","Team 4","Team 5","Team 6","Team 7","Team 8"];
+  const TEAM_COLORS = ["#FFD700","#FF6B6B","#69FF9C","#7EB8FF","#FF9EFF","#FFB347","#80FFDB","#FF8C94"];
+  const ROW_VALUES  = { 1:[100,200,300,400,500], 2:[200,400,600,800,1000] };
+
+  const SAMPLE = `# Tamil Songs
+Which song has the lyric "Enna Solla Pogirai"?|Enna Solla Pogirai (Kandukondain)
+Name the movie with "Mukkala Muqabla".|Kadhalan
+Who sang "Vennilave Vennilave"?|Unnamalai
+Name the song: "Chinna Chinna Aasai".|Roja
+Which 1995 film has "Telephone Manipol"?|Kaadhalan
+
+# Tamil Movies
+Name Shankar's 1994 directorial debut.|Gentleman
+Which Kamal film has multiple personalities?|Dasavathaaram
+Name Rajini's 2010 sci-fi blockbuster.|Enthiran
+Who directed "Vikram" (2022)?|Lokesh Kanagaraj
+Name the first Tamil film shot in New Zealand.|Alaipayuthey (no) — Kadhal Desam
+
+# Tamil Actors
+Which actor is called "Ulaga Nayagan"?|Kamal Haasan
+What is Rajinikanth's original name?|Shivaji Rao Gaekwad
+Who played the villain in "Baashha"?|Raghuvaran
+Name the actress in "Mouna Ragam".|Revathi
+Which actor stars in "96" (2018)?|Vijay Sethupathi
+
+# Tamil History
+In which year was the Dravidian Movement founded?|1916
+Who wrote "Silappatikaram"?|Ilango Adigal
+Which Chola king built Brihadeeswarar Temple?|Raja Raja Chola I
+Name the capital of the Pandya kingdom.|Madurai
+Which ancient Tamil port city traded with Rome?|Puhar`;
+
+  // ---- State (local mirror of Firebase) ----
+  let G = {
+    gameCode: "", phase: "lobby", round: 1, gameName: "Tamil Jeopardy",
+    teams: [], board: [],
+    activeClue: null,
+    buzzers: "closed",
+    buzzOrder: [], lockedTeams: [],
+    pickerTeamId: null,
+    scoreHistory: [],
+    buzzerTimerSecs: 5,
+    buzzerTimerId: null,
+    buzzerTimerStart: null,
+  };
+
+  // ---- Firebase helpers ----
+  const gRef  = () => ref(db, "game");
+  const write = (path, val) => set(ref(db, "game/"+path), val);
+  const patch  = (data)     => update(ref(db, "game"), data);
+
+  function pushState() {
+    const payload = {
+      gameCode:     G.gameCode,
+      gameName:     G.gameName || "Tamil Jeopardy",
+      phase:        G.phase,
+      round:        G.round,
+      teams:        G.teams,
+      board:        G.board,
+      activeClue:   G.activeClue  ?? null,
+      buzzers:      G.buzzers,
+      buzzOrder:    G.buzzOrder,
+      lockedTeams:  G.lockedTeams,
+      pickerTeamId: G.pickerTeamId ?? null,
+      updatedAt:    Date.now(),
+    };
+    set(gRef(), payload);
+  }
+
+  // ---- Utility ----
+  const makeCode = () => Math.random().toString(36).substr(2,6).toUpperCase();
+  const makePin  = () => Math.floor(1000+Math.random()*9000).toString();
+
+  function parseImport(txt) {
+    const lines = txt.split("\n");
+    const cats  = [];
+    let cur     = null;
+    for (let raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith("#")) {
+        if (cur) cats.push(cur);
+        cur = { cat: line.slice(1).trim(), clues: [] };
+      } else if (cur) {
+        const idx = line.indexOf("|");
+        if (idx < 0) continue;
+        cur.clues.push({ q: line.slice(0,idx).trim(), a: line.slice(idx+1).trim(), used: false });
+      }
+    }
+    if (cur) cats.push(cur);
+    if (!cats.length) return "No categories found.";
+    const lens = cats.map(c => c.clues.length);
+    if (lens.some(l => l !== lens[0])) return `Unequal clue counts: ${lens.join(", ")}`;
+    const vals = ROW_VALUES[G.round] || ROW_VALUES[1];
+    cats.forEach(c => c.clues.forEach((cl,i) => { cl.value = vals[i] ?? (i+1)*100; }));
+    G.board = cats;
+    return null;
+  }
+
+  // ---- Sounds ----
+  function beep(type) { /* Audio handled by tv.html */ }
+
+  function tts(text) {
+    set(ref(db,"game/ttsRequest"), { text, time: Date.now() });
+  }
+
+  // ==================== ACTIONS ====================
+
+  function newGame() {
+    // Preserve any custom team names the host already set
+    const savedNames = G.teams.map(t => t.name);
+    G.gameCode     = makeCode();
+    G.phase        = "lobby";
+    G.round        = 1;
+    G.buzzers      = "closed";
+    G.buzzOrder    = [];
+    G.lockedTeams  = [];
+    G.activeClue   = null;
+    G.pickerTeamId = null;
+    G.scoreHistory = [];
+    const n = parseInt(qs("#max-teams").value)||4;
+    G.teams = TEAM_NAMES.slice(0, n).map((name,i) => ({
+      id: "t"+i,
+      name: savedNames[i] || name,   // keep custom name if set
+      color: TEAM_COLORS[i], score: 0, pin: makePin(), connected: 0
+    }));
+    // Keep existing board — only reset if no board loaded yet
+    if (!G.board.length) parseImport(SAMPLE);
+    G.pickerTeamId = G.teams[0]?.id;
+    pushState();
+    renderAll();
+    showMsg("game-msg", "New game created! Code: "+G.gameCode, "success");
+  }
+
+  function startGame() {
+    if (!G.board.length) { showMsg("game-msg","Import questions first!","error"); return; }
+    G.phase = "board";
+    G.teams.forEach(t => t.score = 0);
+    G.board.forEach(c => c.clues.forEach(cl => cl.used = false));
+    G.scoreHistory = [];
+    pushState();
+    renderAll();
+  }
+
+  function importQ() {
+    const txt = qs("#import-text").value.trim();
+    if (!txt) { showMsg("import-msg", "Paste your questions above first, then click Import.", "error"); return; }
+    const err = parseImport(txt);
+    if (err) { showMsg("import-msg", err, "error"); return; }
+    pushState();
+    renderAll();
+    showMsg("import-msg", `✓ Imported ${G.board.length} categories, ${G.board[0]?.clues.length} clues each.`, "success");
+  }
+
+  function loadSample() {
+    qs("#import-text").value = SAMPLE;
+    importQ();
+  }
+
+  function setRound(r) {
+    G.round = parseInt(r);
+    const vals = ROW_VALUES[G.round] || ROW_VALUES[1];
+    G.board.forEach(c => c.clues.forEach((cl,i) => cl.value = vals[i] ?? (i+1)*100));
+    pushState(); renderBoard();
+  }
+
+  function regenerateTeams() {
+    const n = parseInt(qs("#max-teams").value)||4;
+    G.teams = TEAM_NAMES.slice(0,n).map((name,i) => ({
+      id:"t"+i, name, color:TEAM_COLORS[i], score:0, pin:makePin(), connected:0
+    }));
+    G.pickerTeamId = G.teams[0]?.id;
+    pushState(); renderTeams(); renderTeamSetup();
+  }
+
+  function openClue(catIdx, clueIdx) {
+    if (G.phase !== "board") return;
+    const clue = G.board[catIdx]?.clues[clueIdx];
+    if (!clue || clue.used) return;
+    G.activeClue   = { catIdx, clueIdx, cat: G.board[catIdx].cat, q: clue.q, a: clue.a, value: clue.value };
+    G.buzzers      = "closed";
+    G.buzzOrder    = [];
+    G.lockedTeams  = [];
+    G.phase        = "clue";
+    clearBuzzerTimer();
+    pushState();
+    renderCluePanel();
+    renderBoard();
+    // TTS after short delay
+    setTimeout(() => tts(clue.q), 600);
+    // Auto timer
+    const secs = parseInt(qs("#timer-setting").value)||0;
+    if (secs > 0) startBuzzerTimer(secs);
+  }
+
+  function enableBuzzers() {
+    if (G.buzzers === "open") return;
+    G.buzzers = "open";
+    clearBuzzerTimer();
+    write("buzzers", "open");
+    write("phase", "clue");
+    beep("open");
+    renderBuzzerControls();
+    qs("#buzzer-status").textContent = "OPEN";
+    qs("#buzzer-status").className = "badge badge-open";
+  }
+
+  function disableBuzzers() {
+    G.buzzers = "closed";
+    write("buzzers", "closed");
+    renderBuzzerControls();
+    qs("#buzzer-status").textContent = "CLOSED";
+    qs("#buzzer-status").className = "badge badge-closed";
+  }
+
+  function startBuzzerTimer(secs) {
+    G.buzzerTimerSecs  = secs;
+    G.buzzerTimerStart = Date.now();
+    const bar  = qs("#timer-bar-fill");
+    const disp = qs("#timer-disp");
+    G.buzzerTimerId = setInterval(() => {
+      const elapsed = (Date.now()-G.buzzerTimerStart)/1000;
+      const rem = Math.max(0, secs-elapsed);
+      if (bar)  bar.style.width  = ((rem/secs)*100)+"%";
+      if (disp) disp.textContent = rem > 0 ? rem.toFixed(1)+"s" : "—";
+      if (rem <= 0) { clearBuzzerTimer(); if (G.buzzers==="closed") enableBuzzers(); }
+    }, 50);
+  }
+
+  function clearBuzzerTimer() {
+    if (G.buzzerTimerId) { clearInterval(G.buzzerTimerId); G.buzzerTimerId = null; }
+    const bar = qs("#timer-bar-fill"); const disp = qs("#timer-disp");
+    if (bar)  bar.style.width = "100%";
+    if (disp) disp.textContent = "—";
+  }
+
+  function judgeAnswer(correct) {
+    const entry = G.buzzOrder[currentJudgeIdx()];
+    if (!entry) return;
+    const teamId = entry.teamId;
+    const team   = G.teams.find(t => t.id===teamId);
+    if (!team) return;
+    const val  = G.activeClue.value;
+    const delta = correct ? val : -val;
+    team.score += delta;
+    G.scoreHistory.push({ teamId, delta, clueVal: val });
+    if (correct) {
+      G.pickerTeamId = teamId;
+      beep("correct");
+      closeClue("correct", teamId);
+    } else {
+      beep("wrong");
+      G.lockedTeams.push(teamId);
+      // Check if any remaining buzz order entries are eligible
+      const nextEligible = G.buzzOrder.find(b => !G.lockedTeams.includes(b.teamId));
+      if (!nextEligible) {
+        // All buzzed teams are wrong — auto-reveal after 2s pause
+        pushState(); renderCluePanel(); renderTeams();
+        setTimeout(() => closeClue("nobody", null), 2000);
+        return;
+      }
+      pushState();
+      renderCluePanel();
+      renderTeams();
+    }
+  }
+
+  function currentJudgeIdx() {
+    // Find first in buzzOrder not locked
+    return G.buzzOrder.findIndex(b => !G.lockedTeams.includes(b.teamId));
+  }
+
+  function revealAndClose() {
+    closeClue("nobody", null);
+  }
+
+  function closeClue(result, winnerTeamId) {
+    if (!G.activeClue) return;
+    G.board[G.activeClue.catIdx].clues[G.activeClue.clueIdx].used = true;
+    G.phase       = "answer";
+    G.buzzers     = "closed";
+    G.buzzOrder   = [];
+    G.lockedTeams = [];
+    clearBuzzerTimer();
+    const payload = { result, winnerTeamId: winnerTeamId ?? null, updatedAt: Date.now() };
+    write("lastResult", payload);
+    pushState();
+    renderAll();
+    // After 4s go to board
+    setTimeout(() => {
+      if (G.phase === "answer") {
+        G.phase      = "board";
+        G.activeClue = null;
+        const allUsed = G.board.every(c => c.clues.every(cl => cl.used));
+        if (allUsed) { G.phase = "ended"; }
+        pushState(); renderAll();
+      }
+    }, 4000);
+  }
+
+  function undoScore() {
+    const last = G.scoreHistory.pop();
+    if (!last) return;
+    const team = G.teams.find(t => t.id===last.teamId);
+    if (team) team.score -= last.delta;
+    pushState(); renderTeams();
+    showMsg("undo-msg","Score undone.","success");
+  }
+
+  function clearBuzzWinner() {
+    G.buzzOrder   = [];
+    G.lockedTeams = [];
+    write("buzzOrder", []);
+    write("lockedTeams", []);
+    renderCluePanel();
+  }
+
+  function resetClue() {
+    G.buzzers     = "closed";
+    G.buzzOrder   = [];
+    G.lockedTeams = [];
+    clearBuzzerTimer();
+    pushState(); renderCluePanel(); renderBuzzerControls();
+  }
+
+  function forceWinner() {
+    const tid = qs("#override-team").value;
+    if (!tid) return;
+    if (!G.buzzOrder.find(b => b.teamId===tid)) {
+      G.buzzOrder.unshift({ teamId: tid, time: Date.now() });
+    }
+    G.lockedTeams = G.lockedTeams.filter(id => id!==tid);
+    write("buzzOrder", G.buzzOrder);
+    write("lockedTeams", G.lockedTeams);
+    renderCluePanel();
+  }
+
+  function manualScore() {
+    const tid = qs("#override-score-team").value;
+    const amt = parseInt(qs("#override-score-amt").value)||0;
+    const team = G.teams.find(t => t.id===tid);
+    if (!team) return;
+    team.score += amt;
+    G.scoreHistory.push({ teamId: tid, delta: amt, clueVal: 0 });
+    qs("#override-score-amt").value = "";
+    pushState(); renderTeams();
+  }
+
+  function endGame() {
+    G.phase = "ended";
+    pushState(); renderAll();
+  }
+
+  // ==================== RENDER ====================
+
+  const qs  = s => document.querySelector(s);
+  const qsa = s => document.querySelectorAll(s);
+
+  function renderAll() {
+    renderBoard();
+    renderTeams();
+    renderTeamSetup();
+    renderCluePanel();
+    renderBuzzerControls();
+    renderPhaseLabel();
+    populateOverrides();
+  }
+
+  function renderPhaseLabel() {
+    const el = qs("#phase-label");
+    const labels = { lobby:"LOBBY", board:"PLAYING", clue:"CLUE OPEN", answer:"ANSWER", ended:"GAME OVER" };
+    el.textContent = labels[G.phase] || G.phase.toUpperCase();
+    el.className = "badge " + (G.phase==="board"||G.phase==="clue" ? "badge-open" : G.phase==="ended" ? "badge-warn" : "badge-closed");
+    qs("#picker-label").textContent = G.pickerTeamId ? "🎯 "+teamName(G.pickerTeamId)+" picks next" : "";
+    qs("#game-code-display").textContent = G.gameCode || "—";
+  }
+
+  function renderBoard() {
+    const grid = qs("#admin-board");
+    if (!G.board.length) { grid.innerHTML = '<div class="no-data">No questions loaded. Import below.</div>'; return; }
+    const n = G.board.length;
+    grid.style.gridTemplateColumns = `repeat(${n},1fr)`;
+    grid.innerHTML = "";
+    G.board.forEach(c => {
+      const h = el("div","cat-head"); h.textContent = c.cat; grid.appendChild(h);
+    });
+    const rows = G.board[0].clues.length;
+    for (let r=0; r<rows; r++) {
+      G.board.forEach((c,ci) => {
+        const cl = c.clues[r];
+        const isActive = G.activeClue && G.activeClue.catIdx===ci && G.activeClue.clueIdx===r;
+        const t = el("div", "a-tile"+(cl.used?" used":"")+(isActive?" active-tile":""));
+        t.textContent = "$"+cl.value;
+        if (!cl.used) t.onclick = () => openClue(ci, r);
+        grid.appendChild(t);
+      });
+    }
+  }
+
+  function renderTeams() {
+    const el_ = qs("#teams-list");
+    el_.innerHTML = "";
+    [...G.teams].sort((a,b)=>b.score-a.score).forEach(t => {
+      const row = el("div","team-row"+(t.score<0?" neg":"")+(t.id===G.pickerTeamId?" picker":""));
+      row.innerHTML = `
+        <span class="dot" style="background:${t.color}"></span>
+        <span class="tr-name">${t.name}</span>
+        ${t.id===G.pickerTeamId?'<span class="badge badge-warn" style="font-size:10px">PICKS</span>':""}
+        <span class="tr-conn">${(t.connected||0)>0?"●"+t.connected:""}</span>
+        <span class="tr-score" style="color:${t.score<0?"#ff6b6b":t.color}">${t.score}</span>`;
+      el_.appendChild(row);
+    });
+  }
+
+  function renderTeamSetup() {
+    const el_ = qs("#team-setup");
+    el_.innerHTML = "";
+    G.teams.forEach(t => {
+      const row = el("div","setup-row");
+      row.innerHTML = `
+        <span class="dot" style="background:${t.color}"></span>
+        <input class="a-input sm" value="${t.name}" onchange="updateTeamName('${t.id}',this.value)">
+        <span class="pin-badge">PIN&nbsp;${t.pin}</span>`;
+      el_.appendChild(row);
+    });
+  }
+
+  function renderCluePanel() {
+    const noClue = qs("#no-clue");
+    const clueBox = qs("#clue-box");
+    const ctrls   = qs("#clue-controls");
+    if (!G.activeClue) {
+      noClue.style.display  = "block";
+      clueBox.style.display = "none";
+      ctrls.style.display   = "none";
+      return;
+    }
+    noClue.style.display  = "none";
+    clueBox.style.display = "block";
+    ctrls.style.display   = "block";
+    const cl = G.activeClue;
+    qs("#ci-cat").textContent = cl.cat;
+    qs("#ci-val").textContent = "$"+cl.value;
+    qs("#ci-q").textContent   = cl.q;
+    qs("#ci-a").textContent   = cl.a;
+    // Buzz order
+    const ul = qs("#buzz-order-list");
+    ul.innerHTML = "";
+    if (!G.buzzOrder.length) {
+      ul.innerHTML = '<li class="bo-empty">No buzzes yet</li>';
+    } else {
+      const judgeIdx = currentJudgeIdx();
+      G.buzzOrder.forEach((b,i) => {
+        const locked  = G.lockedTeams.includes(b.teamId);
+        const current = i === judgeIdx && !locked;
+        const team    = G.teams.find(t=>t.id===b.teamId);
+        const li = el("li","bo-item"+(locked?" locked":"")+(current?" current":""));
+        li.innerHTML = `<span class="bo-rank">${i+1}</span>
+          <span style="color:${team?.color||"#fff"}">${team?.name||b.teamId}</span>
+          ${locked?'<span class="badge badge-err">OUT</span>':""}
+          ${current?'<span class="badge badge-open">JUDGING</span>':""}`;
+        ul.appendChild(li);
+      });
+    }
+    // Judge buttons
+    const hasTarget = currentJudgeIdx() >= 0;
+    qs("#btn-correct").disabled = !hasTarget;
+    qs("#btn-wrong").disabled   = !hasTarget;
+    renderBuzzerControls();
+  }
+
+  function renderBuzzerControls() {
+    const isOpen = G.buzzers === "open";
+    qs("#btn-enable").disabled  = isOpen;
+    qs("#btn-disable").disabled = !isOpen;
+    const ind = qs("#buzzer-status");
+    ind.textContent = isOpen ? "OPEN" : "CLOSED";
+    ind.className   = "badge "+(isOpen?"badge-open":"badge-closed");
+  }
+
+  function populateOverrides() {
+    ["#override-team","#override-score-team"].forEach(sel => {
+      const el_ = qs(sel);
+      if (!el_) return;
+      el_.innerHTML = G.teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join("");
+    });
+  }
+
+  function teamName(id) { return G.teams.find(t=>t.id===id)?.name || id; }
+  function el(tag,cls) { const e=document.createElement(tag); if(cls) e.className=cls; return e; }
+
+  function showMsg(id, text, type) {
+    const el_ = qs("#"+id);
+    if (!el_) return;
+    el_.textContent = text;
+    el_.className = "msg msg-"+(type||"info");
+    clearTimeout(el_._t);
+    el_._t = setTimeout(()=>{ el_.textContent=""; el_.className="msg"; }, 4000);
+  }
+
+  // Listen for buzzes from Firebase
+  onValue(ref(db,"game/buzzOrder"), snap => {
+    const val = snap.val();
+    if (Array.isArray(val)) {
+      G.buzzOrder = val;
+      renderCluePanel();
+    }
+  });
+
+  onValue(ref(db,"game/teams"), snap => {
+    const val = snap.val();
+    if (Array.isArray(val)) {
+      // Only update connection counts from Firebase, not scores (admin is source of truth)
+      val.forEach(ft => {
+        const lt = G.teams.find(t=>t.id===ft.id);
+        if (lt) lt.connected = ft.connected||0;
+      });
+      renderTeams();
+    }
+  });
+
+  // Expose to onclick handlers
+  window.G = {
+    newGame, startGame, importQ, loadSample, setRound, regenerateTeams,
+    openClue, enableBuzzers, disableBuzzers, judgeAnswer, revealAndClose,
+    undoScore, clearBuzzWinner, resetClue, forceWinner, manualScore, endGame,
+    tts: () => G.activeClue && tts(G.activeClue.q),
+  };
+  window.updateGameName = (name) => { G.gameName = name || "Tamil Jeopardy"; pushState(); };
+  window.updateTeamName = (id, name) => {
+    const t = G.teams.find(t=>t.id===id);
+    if (t) { t.name = name; pushState(); renderTeams(); }
+  };
+
+  // Init on load
+  document.addEventListener("DOMContentLoaded", () => {
+    newGame();
+  });
+</script>
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --gold:#FFD700;--gold2:#b8960c;
+  --bg:#06091a;--bg2:#0b1030;--bg3:#111840;
+  --border:rgba(255,215,0,0.2);
+  --text:#e8e8f0;--muted:#7a82b0;
+  --green:#00C853;--red:#D32F2F;
+}
+body{font-family:'Rajdhani',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;}
+h1{font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--gold);letter-spacing:3px;}
+h2{font-family:'Bebas Neue',sans-serif;font-size:16px;color:var(--gold);letter-spacing:2px;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border);}
+h3{font-size:12px;font-weight:700;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;}
+
+/* Layout */
+#topbar{background:#000;border-bottom:2px solid var(--gold);padding:8px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+#topbar .right{margin-left:auto;display:flex;gap:8px;align-items:center;}
+#topbar .right.top-actions{gap:8px;}
+.btn-top{width:120px;min-width:120px;margin:0;padding:6px 16px;text-align:center;}
+.btn-danger{color:#ff6b6b;border-color:rgba(211,47,47,.6);}
+#layout{display:grid;grid-template-columns:260px 1fr 280px;height:calc(100vh - 52px);overflow:hidden;}
+.panel{padding:14px;border-right:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column;gap:12px;}
+.panel:last-child{border-right:none;}
+
+/* Board */
+#admin-board{display:grid;gap:3px;}
+.cat-head{background:var(--bg3);border:1px solid var(--gold2);border-radius:4px;padding:5px 4px;font-size:10px;font-weight:700;color:var(--gold);text-align:center;word-break:break-word;}
+.a-tile{background:#0d1540;border:1px solid rgba(255,215,0,0.35);border-radius:4px;padding:6px 2px;font-family:'Bebas Neue',sans-serif;font-size:14px;color:var(--gold);text-align:center;cursor:pointer;transition:all .15s;}
+.a-tile:hover:not(.used){background:#1a2560;transform:scale(1.03);}
+.a-tile.used{background:#0a0c1a;border-color:#1a1a2a;color:#2a2f4a;cursor:default;text-decoration:line-through;}
+.a-tile.active-tile{border-color:#fff;box-shadow:0 0 8px rgba(255,255,255,0.4);}
+.no-data{font-size:12px;color:var(--muted);padding:8px;text-align:center;}
+
+/* Badges */
+.badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:.5px;}
+.badge-open{background:rgba(0,200,83,.2);color:#69ff9c;border:1px solid rgba(0,200,83,.4);}
+.badge-closed{background:rgba(100,120,255,.1);color:#aab4ff;border:1px solid rgba(100,120,255,.3);}
+.badge-warn{background:rgba(255,215,0,.2);color:var(--gold);border:1px solid rgba(255,215,0,.4);}
+.badge-err{background:rgba(211,47,47,.2);color:#ff6b6b;border:1px solid rgba(211,47,47,.4);}
+
+/* Buttons */
+.btn{display:block;width:100%;padding:8px 12px;border:1.5px solid rgba(255,215,0,.5);background:transparent;color:var(--gold);font-family:'Rajdhani',sans-serif;font-weight:600;font-size:14px;cursor:pointer;border-radius:6px;margin-bottom:6px;transition:all .2s;text-align:left;letter-spacing:.5px;}
+.btn:hover:not(:disabled){background:rgba(255,215,0,.12);}
+.btn:disabled{opacity:.3;cursor:not-allowed;}
+.btn.sm{padding:5px 10px;font-size:12px;margin-bottom:4px;}
+.btn.green{border-color:rgba(0,200,83,.5);color:#69ff9c;}
+.btn.green:hover:not(:disabled){background:rgba(0,200,83,.12);}
+.btn.red{border-color:rgba(211,47,47,.5);color:#ff6b6b;}
+.btn.red:hover:not(:disabled){background:rgba(211,47,47,.12);}
+.btn.primary{background:var(--gold);color:#000;border-color:var(--gold);}
+.btn.primary:hover:not(:disabled){background:#ffe040;}
+
+/* Inputs */
+.a-input{background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 10px;font-family:'Rajdhani',sans-serif;font-size:13px;width:100%;margin-bottom:6px;}
+.a-input:focus{outline:none;border-color:var(--gold);}
+.a-input.sm{padding:4px 8px;font-size:12px;margin-bottom:0;}
+.a-select{background:#070e35;border:1px solid var(--border);border-radius:6px;color:var(--gold);padding:6px 10px;font-family:'Rajdhani',sans-serif;font-size:13px;width:100%;margin-bottom:6px;cursor:pointer;}
+.a-select:focus{outline:none;border-color:var(--gold);}
+textarea.a-input{min-height:110px;resize:vertical;font-size:11px;line-height:1.5;}
+
+/* Centre panel compact cards */
+.cp{gap:8px;}
+.cp-empty{font-size:14px;color:#aab4ff;padding:14px;border:1px solid rgba(100,100,255,.3);border-radius:8px;text-align:center;}
+.cp-card{background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:8px;padding:12px;}
+.cp-card-title{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;display:flex;align-items:center;gap:8px;}
+.cp-row{display:flex;gap:6px;align-items:center;}
+.cp-btn{padding:7px 12px;border:1.5px solid rgba(255,215,0,.4);background:transparent;color:var(--gold);font-family:'Rajdhani',sans-serif;font-weight:700;font-size:13px;cursor:pointer;border-radius:6px;transition:all .15s;white-space:nowrap;}
+.cp-btn:disabled{opacity:.3;cursor:not-allowed;}
+.cp-btn.green{border-color:rgba(0,200,83,.5);color:#69ff9c;}
+.cp-btn.green:hover:not(:disabled){background:rgba(0,200,83,.12);}
+.cp-btn.red{border-color:rgba(211,47,47,.5);color:#ff6b6b;}
+.cp-btn.red:hover:not(:disabled){background:rgba(211,47,47,.12);}
+.cp-btn.lg{flex:1;font-size:15px;padding:9px 8px;text-align:center;}
+.cp-btn-sm{padding:5px 9px;border:1px solid rgba(255,215,0,.3);background:transparent;color:#aab4ff;font-family:'Rajdhani',sans-serif;font-weight:600;font-size:12px;cursor:pointer;border-radius:5px;white-space:nowrap;transition:all .15s;}
+.cp-btn-sm:hover{background:rgba(255,255,255,.06);color:#fff;}
+/* Clue box (inside cp-card) */
+.clue-box{background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:8px;padding:12px;}
+#ci-cat{font-size:12px;color:var(--muted);margin-bottom:4px;font-weight:700;letter-spacing:1px;}
+#ci-val{font-family:'Bebas Neue',sans-serif;font-size:34px;color:var(--gold);margin-bottom:8px;}
+#ci-q{font-size:17px;color:var(--text);margin-bottom:10px;line-height:1.45;font-weight:600;}
+#ci-a{font-size:15px;color:var(--muted);padding-top:6px;border-top:1px solid rgba(255,215,0,.15);}
+#ci-a span{color:#fff;font-weight:700;font-size:16px;}
+
+/* Timer */
+.timer-row{display:flex;align-items:center;gap:8px;margin-bottom:4px;}
+#timer-disp{font-family:'Bebas Neue',sans-serif;font-size:28px;color:var(--gold);min-width:52px;}
+.timer-bar{height:5px;background:rgba(255,255,255,.1);border-radius:3px;overflow:hidden;flex:1;}
+#timer-bar-fill{height:100%;background:var(--gold);transition:width .1s linear;border-radius:3px;}
+
+/* Buzz order */
+.buzz-order-list{list-style:none;margin-bottom:6px;}
+.bo-item{display:flex;align-items:center;gap:6px;padding:5px 8px;margin-bottom:3px;background:rgba(255,255,255,.04);border-radius:5px;font-size:13px;border:1px solid transparent;}
+.bo-item.locked{opacity:.35;text-decoration:line-through;}
+.bo-item.current{background:rgba(255,215,0,.08);border-color:rgba(255,215,0,.3);}
+.bo-rank{font-family:'Bebas Neue',sans-serif;font-size:16px;color:var(--gold);min-width:18px;}
+.bo-empty{color:var(--muted);font-size:12px;padding:4px 0;}
+
+/* Teams */
+.team-row{display:flex;align-items:center;gap:8px;padding:7px 10px;margin-bottom:4px;background:rgba(255,255,255,.04);border-radius:7px;border:1px solid rgba(255,255,255,.06);}
+.team-row.picker{background:rgba(255,215,0,.07);border-color:rgba(255,215,0,.2);}
+.dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.tr-name{flex:1;font-size:14px;font-weight:600;}
+.tr-conn{font-size:11px;color:#69ff9c;min-width:24px;}
+.tr-score{font-family:'Bebas Neue',sans-serif;font-size:24px;min-width:52px;text-align:right;}
+.tr-score.neg{color:#ff6b6b;}
+
+/* Setup */
+.setup-row{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
+.setup-row .a-input{flex:1;min-width:80px;margin-bottom:0;}
+.pin-badge{font-size:13px;font-weight:700;color:#aab4ff;white-space:nowrap;letter-spacing:1px;min-width:72px;text-align:right;}
+
+/* Divider */
+hr{border:none;border-top:1px solid var(--border);margin:4px 0;}
+
+/* Msg */
+.msg{font-size:12px;min-height:18px;margin-bottom:4px;}
+.msg-success{color:#69ff9c;}
+.msg-error{color:#ff6b6b;}
+.msg-info{color:#aab4ff;}
+
+/* Misc */
+#game-code-display{font-family:'Bebas Neue',sans-serif;font-size:28px;color:#fff;letter-spacing:8px;}
+#picker-label{font-size:17px;font-weight:700;color:var(--gold);letter-spacing:.5px;}
+.flex-row{display:flex;gap:6px;align-items:center;}
+.flex-row .a-input,.flex-row .btn{margin-bottom:0;}
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <h1>🎛 ADMIN</h1>
+  <span class="badge badge-closed" id="phase-label">LOBBY</span>
+  <div id="game-code-display">——</div>
+  <span id="picker-label"></span>
+  <div class="right top-actions">
+  <button class="btn btn-top btn-danger" onclick="G.endGame()">End Game</button>
+  <button class="btn btn-top primary" onclick="G.newGame()">New Game</button>
+</div>
+</div>
+
+<div id="layout">
+
+  <!-- ===== LEFT: Board + Import ===== -->
+  <div class="panel">
+    <div>
+      <h2>BOARD</h2>
+      <div id="admin-board"></div>
+    </div>
+    <hr>
+    <div>
+      <h2>SETUP</h2>
+      <h3>Game Title</h3>
+      <input class="a-input" id="game-name-input" placeholder="Tamil Jeopardy" oninput="updateGameName(this.value)" style="font-size:15px;font-weight:600;">
+      <h3>Max Teams</h3>
+      <select class="a-select" id="max-teams">
+        <option value="2">2 Teams</option>
+        <option value="3">3 Teams</option>
+        <option value="4" selected>4 Teams</option>
+        <option value="5">5 Teams</option>
+        <option value="6">6 Teams</option>
+      </select>
+      <h3>Round</h3>
+      <select class="a-select" id="round-select" onchange="G.setRound(this.value)">
+        <option value="1">Round 1 — $100–$500</option>
+        <option value="2">Round 2 — $200–$1000</option>
+      </select>
+      <button class="btn" onclick="G.regenerateTeams()">🔄 Regenerate Teams</button>
+      <button class="btn primary" onclick="G.startGame()">▶ START GAME</button>
+    </div>
+    <hr>
+    <div>
+      <h2>IMPORT QUESTIONS</h2>
+      <h3>Format: # Category → Prompt|Answer</h3>
+      <textarea class="a-input" id="import-text" placeholder="# Category Name&#10;Question text|Answer&#10;Question text|Answer"></textarea>
+      <div class="flex-row" style="margin-bottom:6px;">
+        <button class="btn sm" style="flex:1;margin:0" onclick="G.importQ()">⬆ Import</button>
+        <button class="btn sm" style="flex:1;margin:0" onclick="G.loadSample()">Load Sample</button>
+      </div>
+      <div class="msg" id="import-msg"></div>
+    </div>
+  </div>
+
+  <!-- ===== CENTER: Clue Control ===== -->
+  <div class="panel cp">
+    <!-- No-clue state -->
+    <div id="no-clue" class="cp-empty">Select a tile from the board to open a clue.</div>
+
+    <!-- Active clue card -->
+    <div class="cp-card" id="clue-box" style="display:none;">
+      <div id="ci-cat"></div>
+      <div id="ci-val"></div>
+      <div id="ci-q"></div>
+      <div id="ci-a">Answer: <span></span></div>
+    </div>
+
+    <div id="clue-controls" style="display:none;">
+
+      <!-- Buzzer card -->
+      <div class="cp-card">
+        <div class="cp-card-title">BUZZER <span class="badge badge-closed" id="buzzer-status">CLOSED</span></div>
+        <div class="timer-row" style="margin-bottom:8px;">
+          <div class="timer-bar" style="flex:1;"><div id="timer-bar-fill" style="width:100%"></div></div>
+          <div id="timer-disp">—</div>
+        </div>
+        <div class="cp-row">
+          <select class="a-select" id="timer-setting" style="margin:0;flex:1;">
+            <option value="5" selected>5s auto</option>
+            <option value="7">7s auto</option>
+            <option value="10">10s auto</option>
+            <option value="15">15s auto</option>
+            <option value="0">Manual only</option>
+          </select>
+          <button class="cp-btn-sm" onclick="G.tts()">🔊</button>
+        </div>
+        <div class="cp-row" style="margin-top:6px;">
+          <button class="cp-btn green" id="btn-enable" onclick="G.enableBuzzers()">🔔 Open</button>
+          <button class="cp-btn red" id="btn-disable" onclick="G.disableBuzzers()" disabled>🔕 Close</button>
+        </div>
+      </div>
+
+      <!-- Buzz order + Judge card -->
+      <div class="cp-card">
+        <div class="cp-card-title">BUZZ ORDER</div>
+        <ul class="buzz-order-list" id="buzz-order-list"></ul>
+        <div class="cp-card-title" style="margin-top:8px;">JUDGE</div>
+        <div class="cp-row">
+          <button class="cp-btn green lg" id="btn-correct" onclick="G.judgeAnswer(true)" disabled>✓ CORRECT</button>
+          <button class="cp-btn red lg" id="btn-wrong" onclick="G.judgeAnswer(false)" disabled>✗ WRONG</button>
+        </div>
+        <button class="cp-btn" style="width:100%;margin-top:6px;" id="btn-reveal" onclick="G.revealAndClose()">👁 Reveal &amp; Close</button>
+      </div>
+
+      <!-- Recovery card -->
+      <div class="cp-card">
+        <div class="cp-card-title">RECOVERY</div>
+        <div class="cp-row">
+          <button class="cp-btn-sm" onclick="G.undoScore()">↩ Undo Score</button>
+          <button class="cp-btn-sm" onclick="G.clearBuzzWinner()">↩ Clear Buzz</button>
+          <button class="cp-btn-sm" onclick="G.resetClue()">↩ Reset Clue</button>
+        </div>
+        <div class="msg" id="undo-msg" style="margin-top:4px;"></div>
+      </div>
+
+      <!-- Override card -->
+      <div class="cp-card">
+        <div class="cp-card-title">MANUAL OVERRIDE</div>
+        <div class="cp-row">
+          <select class="a-select" id="override-team" style="margin:0;flex:1;"></select>
+          <button class="cp-btn-sm" onclick="G.forceWinner()">Force Win</button>
+        </div>
+        <div class="cp-row" style="margin-top:6px;">
+          <select class="a-select" id="override-score-team" style="margin:0;flex:1;"></select>
+          <input class="a-input sm" id="override-score-amt" type="number" placeholder="±pts" style="width:60px;margin:0;">
+          <button class="cp-btn-sm" onclick="G.manualScore()">Apply</button>
+        </div>
+      </div>
+
+    </div>
+    <div id="game-msg" class="msg"></div>
+  </div>
+
+  <!-- ===== RIGHT: Teams ===== -->
+  <div class="panel">
+    <div>
+      <h2>SCORES</h2>
+      <div id="teams-list"></div>
+    </div>
+    <hr>
+    <div>
+      <h2>TEAM NAMES</h2>
+      <div id="team-setup"></div>
+    </div>
+    <hr>
+    <div>
+      <h2>TEST TOOLS</h2>
+      <button class="btn sm" onclick="if(navigator.vibrate)navigator.vibrate([200,100,400]);else alert('No vibration')">📳 Test Vibration</button>
+      <button class="btn sm" onclick="G.buzzers='closed';G.enableBuzzers()">🔔 Test Buzzer Open</button>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
