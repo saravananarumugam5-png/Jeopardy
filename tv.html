@@ -10,27 +10,8 @@
      STEP 1: Paste your Firebase config below.
      Same config as admin.html and buzzer.html.
      ============================================================ -->
-<script>
-  // Pre-warm speech synthesis BEFORE module loads — critical for LG WebOS and some browsers.
-  // Module scripts are deferred; this plain script runs immediately and caches voices.
-  window._ttsVoicesReady = false;
-  if (window.speechSynthesis) {
-    var _loadVoices = function() {
-      var v = window.speechSynthesis.getVoices();
-      if (v && v.length) window._ttsVoicesReady = true;
-    };
-    _loadVoices();
-    window.speechSynthesis.onvoiceschanged = _loadVoices;
-    // Some LG TVs need a dummy utterance to unlock TTS
-    window.addEventListener("click", function _unlock() {
-      window.removeEventListener("click", _unlock);
-      var u = new SpeechSynthesisUtterance(" ");
-      u.volume = 0;
-      window.speechSynthesis.speak(u);
-      _loadVoices();
-    }, { once: true });
-  }
-</script>
+<!-- ResponsiveVoice: works on LG WebOS where speechSynthesis has no voices -->
+<script src="https://code.responsivevoice.org/responsivevoice.js?key=FREE"></script>
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
@@ -73,47 +54,23 @@ const firebaseConfig = {
     } catch(e) {}
   }
 
-  // ---- TTS: robust cross-browser including LG WebOS ----
-  // Pre-load voices as soon as possible (must happen outside module scope issue)
+  // ---- TTS via ResponsiveVoice (works on LG WebOS, no voices needed) ----
   function tts(text) {
-    if (!window.speechSynthesis || !text) return;
-    const synth = window.speechSynthesis;
-
-    function doSpeak() {
-      const voices = synth.getVoices() || [];
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 0.85;
-      u.volume = 1;
-      u.pitch = 1;
-
-      // Pick best available voice: Tamil → English → first available
-      const voice =
-        voices.find(v => /^ta/i.test(v.lang)) ||
-        voices.find(v => /^en/i.test(v.lang)) ||
-        voices[0] || null;
-
-      if (voice) {
-        u.voice = voice;
-        u.lang  = voice.lang;
+    if (!text) return;
+    try {
+      if (window.responsiveVoice && responsiveVoice.voiceSupport()) {
+        responsiveVoice.cancel();
+        // Use UK English — clear and available on all platforms
+        responsiveVoice.speak(text, "UK English Female", { rate: 0.9, pitch: 1, volume: 1 });
       } else {
-        u.lang = "en-US";
+        // Fallback to native speechSynthesis if ResponsiveVoice fails to load
+        if (!window.speechSynthesis) return;
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = "en-US"; u.rate = 0.85; u.volume = 1;
+        setTimeout(() => window.speechSynthesis.speak(u), 50);
       }
-
-      // LG WebOS fix: cancel must settle before speak
-      synth.cancel();
-      setTimeout(() => synth.speak(u), 50);
-    }
-
-    // If voices already loaded, speak immediately
-    const voices = synth.getVoices() || [];
-    if (voices.length > 0) {
-      doSpeak();
-    } else {
-      // Wait for voices to load (needed on first call on many browsers)
-      synth.onvoiceschanged = () => { synth.onvoiceschanged = null; doSpeak(); };
-      // Hard fallback after 1s in case onvoiceschanged never fires (LG bug)
-      setTimeout(() => { if (!synth.speaking) doSpeak(); }, 1000);
-    }
+    } catch(e) { console.warn("TTS error:", e); }
   }
 
   // ---- Main listener ----
@@ -343,7 +300,6 @@ const firebaseConfig = {
     qs("#screen-lobby").style.display = "flex";
     qs("#lobby-code").textContent = "Connecting...";
 
-    // TTS voices pre-warmed by inline script above
   });
 </script>
 
