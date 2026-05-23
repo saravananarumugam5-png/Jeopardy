@@ -534,17 +534,18 @@ Which ancient Tamil port city traded with Rome?|Puhar`;
   // Listen for buzzes from Firebase
   onValue(ref(db,"game/buzzOrder"), snap => {
     const val = snap.val();
-    if (Array.isArray(val)) {
-      G.buzzOrder = val;
+    if (val !== null && val !== undefined) {
+      G.buzzOrder = Array.isArray(val) ? val : Object.values(val);
       renderCluePanel();
     }
   });
 
   onValue(ref(db,"game/teams"), snap => {
     const val = snap.val();
-    if (Array.isArray(val)) {
+    const arr = Array.isArray(val) ? val : val ? Object.values(val) : null;
+    if (arr) {
       // Only update connection counts from Firebase, not scores (admin is source of truth)
-      val.forEach(ft => {
+      arr.forEach(ft => {
         const lt = G.teams.find(t=>t.id===ft.id);
         if (lt) lt.connected = ft.connected||0;
       });
